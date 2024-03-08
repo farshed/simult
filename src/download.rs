@@ -1,7 +1,6 @@
 use crate::error::DownloadError;
 use futures::{stream::FuturesUnordered, StreamExt};
 use std::{
-    fmt::format,
     io::SeekFrom,
     path::{Path, PathBuf},
 };
@@ -58,8 +57,6 @@ impl Downloader {
 
     /// Assumes that the host supports [Range requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests) request and tries to download the file at the given `url` in parallel.
     pub async fn parallel(&self, url: &str, content_length: u64) -> Result<(), DownloadError> {
-        let output_path = self.get_output_path(url);
-        let mut file = fs::File::create(&output_path).await?;
         let chunk_size = content_length / self.conn_count as u64;
 
         let mut futures: FuturesUnordered<_> = (0..self.conn_count)
@@ -73,9 +70,16 @@ impl Downloader {
 
                 let client = self.client.clone();
                 let range = format!("bytes={}-{}", start, end);
+                let output_path = self.get_output_path(url);
                 let url = url.to_string();
 
                 tokio::spawn(async move {
+                    let mut file = fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .open(&output_path)
+                        .await?;
+
                     let mut stream = client
                         .get(&url)
                         .header(reqwest::header::RANGE, range)
@@ -95,7 +99,7 @@ impl Downloader {
             .collect();
 
         while let Some(result) = futures.next().await {
-            result?;
+            let _ = result?;
         }
 
         Ok(())
@@ -103,10 +107,14 @@ impl Downloader {
 
     /// Downloads the file at the given `url` serially.
     pub async fn sequential(&self, url: &str) -> Result<(), DownloadError> {
-        let response = self.client.get(url).send().await?.bytes().await?;
+        let mut stream = self.client.get(url).send().await?.bytes_stream();
         let output_path = self.get_output_path(url);
         let mut file = fs::File::create(&output_path).await?;
-        file.write_all(&response).await?;
+
+        while let Some(chunk) = stream.next().await {
+            file.write_all(&chunk?).await?;
+        }
+
         Ok(())
     }
 
@@ -119,11 +127,23 @@ impl Downloader {
             })
             .unwrap_or_else(|| "unnamed".to_owned());
 
+        let p = Path::new(&filename);
+        let file_stem = p
+            .file_stem()
+            .map(|v| v.to_string_lossy().to_string())
+            .unwrap_or("unnamed".to_owned());
+        let ext = p
+            .extension()
+            .map(|v| v.to_string_lossy().to_string())
+            .unwrap_or("".to_owned());
+
         let mut output_path = self.output_dir.join(&filename);
         let mut i = 1;
 
         while output_path.exists() {
-            output_path = self.output_dir.join(format!("{} ({})", &filename, i));
+            output_path = self
+                .output_dir
+                .join(format!("{} ({}).{}", &file_stem, i, ext));
             i += 1;
         }
 
