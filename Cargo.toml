@@ -1,7 +1,13 @@
 [package]
-name = "simult"
-version = "0.2.0"
+name = "zusammen"
+version = "0.1.0"
 edition = "2021"
+description = "Download files in parallel"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/farshed/zusammen"
+homepage = "https://github.com/farshed/zusammen"
+documentation = "https://github.com/farshed/zusammen"
 
 [dependencies]
 futures = "0.3"
