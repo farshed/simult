@@ -18,6 +18,7 @@ pub struct Downloader {
 impl Downloader {
     /// Creates a new Downloader
     pub fn new(output_dir: &str, conn_count: usize) -> Self {
+        let conn_count = if conn_count > 0 { conn_count } else { 1 };
         Self {
             client: reqwest::Client::new(),
             output_dir: PathBuf::from(output_dir),
@@ -26,7 +27,7 @@ impl Downloader {
     }
 
     /// Downloads the file at the given `url` with the best possible strategy.
-    pub async fn download(&self, url: &str) -> Result<(), DownloadError> {
+    pub async fn download(&self, url: &str) -> Result<PathBuf, DownloadError> {
         let response = self.client.head(url).send().await?;
         let headers = response.headers();
         let content_length: u64 = headers
@@ -46,18 +47,38 @@ impl Downloader {
             accept_ranges, content_length
         );
 
-        if content_length > 0 && accept_ranges {
-            self.parallel(url, content_length).await?;
+        let output_path = if content_length > 0 && accept_ranges {
+            self.parallel(url, content_length).await?
         } else {
-            self.sequential(url).await?;
-        }
+            self.sequential(url).await?
+        };
 
-        Ok(())
+        Ok(output_path)
     }
 
-    /// Assumes that the host supports [Range requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests) request and tries to download the file at the given `url` in parallel.
-    pub async fn parallel(&self, url: &str, content_length: u64) -> Result<(), DownloadError> {
+    pub async fn download_multiple(
+        &'static self,
+        urls: &[String],
+    ) -> Result<Vec<PathBuf>, DownloadError> {
+        let chunked = urls.chunks(self.conn_count);
+
+        for batch in chunked {
+            let mut futures: FuturesUnordered<_> = batch
+                .iter()
+                .map(|url| {
+                    let url = url.to_string();
+                    tokio::spawn(async move { self.sequential(&url).await })
+                })
+                .collect();
+        }
+
+        Ok(Vec::new())
+    }
+
+    /// Assumes that the host supports [Range requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests) and tries to download the file at the given `url` in parallel.
+    pub async fn parallel(&self, url: &str, content_length: u64) -> Result<PathBuf, DownloadError> {
         let chunk_size = content_length / self.conn_count as u64;
+        let output_path = self.get_output_path(url);
 
         let mut futures: FuturesUnordered<_> = (0..self.conn_count)
             .map(|i| {
@@ -70,8 +91,8 @@ impl Downloader {
 
                 let client = self.client.clone();
                 let range = format!("bytes={}-{}", start, end);
-                let output_path = self.get_output_path(url);
                 let url = url.to_string();
+                let output_path = output_path.clone();
 
                 tokio::spawn(async move {
                     let mut file = fs::OpenOptions::new()
@@ -102,11 +123,11 @@ impl Downloader {
             let _ = result?;
         }
 
-        Ok(())
+        Ok(PathBuf::from(&output_path))
     }
 
     /// Downloads the file at the given `url` serially.
-    pub async fn sequential(&self, url: &str) -> Result<(), DownloadError> {
+    pub async fn sequential(&self, url: &str) -> Result<PathBuf, DownloadError> {
         let mut stream = self.client.get(url).send().await?.bytes_stream();
         let output_path = self.get_output_path(url);
         let mut file = fs::File::create(&output_path).await?;
@@ -115,7 +136,7 @@ impl Downloader {
             file.write_all(&chunk?).await?;
         }
 
-        Ok(())
+        Ok(PathBuf::from(&output_path))
     }
 
     fn get_output_path(&self, url: &str) -> String {
